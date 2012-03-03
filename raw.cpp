@@ -5,6 +5,7 @@
 #define DBUS_ADAPTER_IFACE BLUEZ_DBUS_BASE_IFC ".Adapter"
 #define DBUS_DEVICE_IFACE BLUEZ_DBUS_BASE_IFC ".Device"
 
+#include <string.h>
 #include <stdint.h>
 #include <dbus/dbus.h>
 #include <stdio.h>
@@ -56,7 +57,7 @@ public:
   bool dbus_returns_boolean(DBusMessage *reply);
 
   template<typename T>
-  bool GetDBusDictValue(DBusMessageIter& iter, const char* name, T& val) {
+  bool GetDBusDictValue(DBusMessageIter& iter, const char* name, int expected_type, T& val) {
     DBusMessageIter dict_entry, dict;
     int size = 0,array_index = 0;
     int len = 0, prop_type = DBUS_TYPE_INVALID, prop_index = -1, type;
@@ -86,6 +87,7 @@ public:
 			}
 			dbus_message_iter_get_basic(&dict_entry, &property);
 			printf("Property: %s\n", property);
+			if(strcmp(property, name) != 0) continue;
 			if (!dbus_message_iter_next(&dict_entry))
 			{
 				printf("No next!\n");
@@ -96,18 +98,18 @@ public:
 				printf("Iter not a variant!\n");
         return false;
 			}
-			// dbus_message_dict_entry_recurse(&dict_entry, &prop_val);
+			dbus_message_iter_recurse(&dict_entry, &prop_val);
 			// type = properties[*prop_index].type;
-			// if (dbus_message_dict_entry_get_arg_type(&prop_val) != type) {
+			if (dbus_message_iter_get_arg_type(&prop_val) != expected_type) {
       //   LOGE("Property type mismatch in get_property: %d, expected:%d, index:%d",
       //        dbus_message_dict_entry_get_arg_type(&prop_val), type, *prop_index);
-      //   return -1;
-			// }
-				
+				printf("Not the type we expect!\n");
+				return false;
+			}
+			dbus_message_iter_get_basic(&prop_val, &val);
+			return true;
     } while(dbus_message_iter_next(&dict));
-
-		
-
+		return false;
   }
 
 	
@@ -314,8 +316,8 @@ public:
 	bool mPowered;
   bool mDiscoverable;
   uint32_t mClass;
-	std::string mAddress;
-	std::string mName;
+	const char* mAddress;
+	const char* mName;
   bool mPairable;
   uint32_t mPairableTimeout;
   uint32_t mDiscoverableTimeout;
@@ -409,7 +411,8 @@ void BluetoothAdapter::get_adapter_properties() {
 		return;
 	}
 	//str_array = parse_adapter_properties(env, &iter);
-	GetDBusDictValue<std::string>(iter, "Name", mName);
+	GetDBusDictValue<const char*>(iter, "Name", DBUS_TYPE_STRING, mName);
+	printf("name! %s\n", mName);
 	dbus_message_unref(reply);
 	printf("Adapter properties got\n");
 }

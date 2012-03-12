@@ -417,9 +417,225 @@ void BluetoothAdapter::get_adapter_properties() {
   printf("Adapter properties got\n");
 }
 
+class DBusThread : protected RawDBusConnection {
+public:
+	DBusThread();
+	~DBusThread();
+	bool setUpEventLoop();
+	static DBusHandlerResult event_filter(DBusConnection *conn, DBusMessage *msg,
+																				void *data);
+
+};
+
+DBusThread::DBusThread()
+{
+	createDBusConnection();
+}
+
+DBusThread::~DBusThread()
+{
+}
+
+bool
+DBusThread::setUpEventLoop()
+{
+	if(!mConnection) {
+		return false;
+	}
+		
+	dbus_threads_init_default();
+	DBusError err;
+	dbus_error_init(&err);
+
+	// Add a filter for all incoming messages_base
+	if (!dbus_connection_add_filter(mConnection, DBusThread::event_filter, this, NULL)){
+		return false;
+	}
+
+	// Set which messages will be processed by this dbus connection
+	dbus_bus_add_match(mConnection,
+										 "type='signal',interface='org.freedesktop.DBus'",
+										 &err);
+	if (dbus_error_is_set(&err)) {
+		//LOG_AND_FREE_DBUS_ERROR(&err);
+		return false;
+	}
+	dbus_bus_add_match(mConnection,
+										 "type='signal',interface='"BLUEZ_DBUS_BASE_IFC".Adapter'",
+										 &err);
+	if (dbus_error_is_set(&err)) {
+		return false;
+	}
+	dbus_bus_add_match(mConnection,
+										 "type='signal',interface='"BLUEZ_DBUS_BASE_IFC".Device'",
+										 &err);
+	if (dbus_error_is_set(&err)) {
+		return false;
+	}
+	dbus_bus_add_match(mConnection,
+										 "type='signal',interface='org.bluez.AudioSink'",
+										 &err);
+	if (dbus_error_is_set(&err)) {
+		return false;
+	}
+	
+	// const char *agent_path = "/android/bluetooth/agent";
+	// const char *capabilities = "DisplayYesNo";
+	// if (register_agent(nat, agent_path, capabilities) < 0) {
+	// 	dbus_connection_unregister_object_path (nat->conn, agent_path);
+	// 	return JNI_FALSE;
+	// }
+	return true;
+}
+
+// Called by dbus during WaitForAndDispatchEventNative()
+DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *msg,
+                                      void *data) {
+//     native_data_t *nat;
+//     JNIEnv *env;
+//     DBusError err;
+//     DBusHandlerResult ret;
+
+//     dbus_error_init(&err);
+
+//     nat = (native_data_t *)data;
+//     nat->vm->GetEnv((void**)&env, nat->envVer);
+//     if (dbus_message_get_type(msg) != DBUS_MESSAGE_TYPE_SIGNAL) {
+//         LOGV("%s: not interested (not a signal).", __FUNCTION__);
+//         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+//     }
+
+//     LOGE("%s: Received signal %s:%s from %s", __FUNCTION__,
+//         dbus_message_get_interface(msg), dbus_message_get_member(msg),
+//         dbus_message_get_path(msg));
+
+//     env->PushLocalFrame(EVENT_LOOP_REFS);
+//     if (dbus_message_is_signal(msg,
+//                                "org.bluez.Adapter",
+//                                "DeviceFound")) {
+//         char *c_address;
+//         DBusMessageIter iter;
+//         jobjectArray str_array = NULL;
+//         if (dbus_message_iter_init(msg, &iter)) {
+//             dbus_message_iter_get_basic(&iter, &c_address);
+//             if (dbus_message_iter_next(&iter))
+//                 str_array =
+//                     parse_remote_device_properties(env, &iter);
+//         }
+//         if (str_array != NULL) {
+//             env->CallVoidMethod(nat->me,
+//                                 method_onDeviceFound,
+//                                 env->NewStringUTF(c_address),
+//                                 str_array);
+//         } else
+//             LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
+//         goto success;
+//     } else if (dbus_message_is_signal(msg,
+//                                      "org.bluez.Adapter",
+//                                      "DeviceDisappeared")) {
+//         char *c_address;
+//         if (dbus_message_get_args(msg, &err,
+//                                   DBUS_TYPE_STRING, &c_address,
+//                                   DBUS_TYPE_INVALID)) {
+//             LOGV("... address = %s", c_address);
+//             env->CallVoidMethod(nat->me, method_onDeviceDisappeared,
+//                                 env->NewStringUTF(c_address));
+//         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
+//         goto success;
+//     } else if (dbus_message_is_signal(msg,
+//                                      "org.bluez.Adapter",
+//                                      "DeviceCreated")) {
+//         char *c_object_path;
+//         if (dbus_message_get_args(msg, &err,
+//                                   DBUS_TYPE_OBJECT_PATH, &c_object_path,
+//                                   DBUS_TYPE_INVALID)) {
+//             LOGV("... address = %s", c_object_path);
+//             env->CallVoidMethod(nat->me,
+//                                 method_onDeviceCreated,
+//                                 env->NewStringUTF(c_object_path));
+//         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
+//         goto success;
+//     } else if (dbus_message_is_signal(msg,
+//                                      "org.bluez.Adapter",
+//                                      "DeviceRemoved")) {
+//         char *c_object_path;
+//         if (dbus_message_get_args(msg, &err,
+//                                  DBUS_TYPE_OBJECT_PATH, &c_object_path,
+//                                  DBUS_TYPE_INVALID)) {
+//            LOGV("... Object Path = %s", c_object_path);
+//            env->CallVoidMethod(nat->me,
+//                                method_onDeviceRemoved,
+//                                env->NewStringUTF(c_object_path));
+//         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
+//         goto success;
+//     } else if (dbus_message_is_signal(msg,
+//                                       "org.bluez.Adapter",
+//                                       "PropertyChanged")) {
+//         jobjectArray str_array = parse_adapter_property_change(env, msg);
+//         if (str_array != NULL) {
+//             /* Check if bluetoothd has (re)started, if so update the path. */
+//             jstring property =(jstring) env->GetObjectArrayElement(str_array, 0);
+//             const char *c_property = env->GetStringUTFChars(property, NULL);
+//             if (!strncmp(c_property, "Powered", strlen("Powered"))) {
+//                 jstring value =
+//                     (jstring) env->GetObjectArrayElement(str_array, 1);
+//                 const char *c_value = env->GetStringUTFChars(value, NULL);
+//                 if (!strncmp(c_value, "true", strlen("true")))
+//                     nat->adapter = get_adapter_path(nat->conn);
+//                 env->ReleaseStringUTFChars(value, c_value);
+//             }
+//             env->ReleaseStringUTFChars(property, c_property);
+
+//             env->CallVoidMethod(nat->me,
+//                               method_onPropertyChanged,
+//                               str_array);
+//         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
+//         goto success;
+//     } else if (dbus_message_is_signal(msg,
+//                                       "org.bluez.Device",
+//                                       "PropertyChanged")) {
+//         jobjectArray str_array = parse_remote_device_property_change(env, msg);
+//         if (str_array != NULL) {
+//             const char *remote_device_path = dbus_message_get_path(msg);
+//             env->CallVoidMethod(nat->me,
+//                             method_onDevicePropertyChanged,
+//                             env->NewStringUTF(remote_device_path),
+//                             str_array);
+//         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
+//         goto success;
+//     } else if (dbus_message_is_signal(msg,
+//                                       "org.bluez.Device",
+//                                       "DisconnectRequested")) {
+//         const char *remote_device_path = dbus_message_get_path(msg);
+//         env->CallVoidMethod(nat->me,
+//                             method_onDeviceDisconnectRequested,
+//                             env->NewStringUTF(remote_device_path));
+//         goto success;
+//     }
+
+//     ret = a2dp_event_filter(msg, env);
+//     env->PopLocalFrame(NULL);
+//     return ret;
+
+// success:
+//     env->PopLocalFrame(NULL);
+    return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+
 int main(int argc, char** argv) {
+	DBusThread t;
   BluetoothAdapter b;
   b.createDBusConnection();
+	if(!t.setUpEventLoop()) {
+		printf("Cannot set up event loop!\n");
+		return 1;
+	}
   b.get_adapter_path();
   b.get_adapter_properties();
+	// b.start_dbus_thread();
+	// b.start_device_discovery();
+	// sleep(10000);
+	// b.stop_device_discovery();
+	return 0;
 }

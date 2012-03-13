@@ -11,6 +11,13 @@
 #include <stdio.h>
 #include <string>
 #include <stdlib.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <poll.h>
+
+// size of the dbus event loops pollfd structure, hopefully never to be grown
+#define DEFAULT_INITIAL_POLLFD_COUNT 8
 
 class RawDBusConnection
 {
@@ -112,7 +119,7 @@ public:
     return false;
   }
 
-  
+	virtual void EventFilter(DBusMessage* msg) = 0;
 protected:
   DBusConnection* mConnection;  
 };
@@ -312,6 +319,8 @@ public:
 
   void get_adapter_path ();
   void get_adapter_properties();
+
+	virtual void EventFilter(DBusMessage* msg);
   const char* mAdapterPath;
   bool mPowered;
   bool mDiscoverable;
@@ -326,6 +335,9 @@ public:
 
 BluetoothAdapter::BluetoothAdapter() {
   
+}
+
+void BluetoothAdapter::EventFilter(DBusMessage* msg) {
 }
 
 void BluetoothAdapter::get_adapter_path() {
@@ -422,14 +434,39 @@ public:
 	DBusThread();
 	~DBusThread();
 	bool setUpEventLoop();
+	bool startEventLoop();
+	void stopEventLoop();
+	bool isEventLoopRunning();
+	static void* eventLoop(void* ptr);
 	static DBusHandlerResult event_filter(DBusConnection *conn, DBusMessage *msg,
 																				void *data);
-
+	void EventFilter(DBusMessage* msg);
+	
+	/* protects the thread */
+	pthread_mutex_t thread_mutex;
+	pthread_t thread;
+	/* our comms socket */
+	/* mem for the list of sockets to listen to */
+	struct pollfd *pollData;
+	int pollMemberCount;
+	int pollDataSize;
+	/* mem for matching set of dbus watch ptrs */
+	DBusWatch **watchData;
+	/* pair of sockets for event loop control, Reader and Writer */
+	int controlFdR;
+	int controlFdW;
+	bool running;
 };
+
+void DBusThread::EventFilter(DBusMessage* msg) {
+	printf("I SHOULD NOT BE BEING CALLED\n");
+}
 
 DBusThread::DBusThread()
 {
 	createDBusConnection();
+	pthread_mutex_init(&(thread_mutex), NULL);
+	pollData = NULL;
 }
 
 DBusThread::~DBusThread()
@@ -490,24 +527,24 @@ DBusThread::setUpEventLoop()
 
 // Called by dbus during WaitForAndDispatchEventNative()
 DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *msg,
-                                      void *data) {
+																					 void *data) {
 //     native_data_t *nat;
 //     JNIEnv *env;
-//     DBusError err;
-//     DBusHandlerResult ret;
+	DBusError err;
+	DBusHandlerResult ret;
 
-//     dbus_error_init(&err);
+	dbus_error_init(&err);
 
 //     nat = (native_data_t *)data;
 //     nat->vm->GetEnv((void**)&env, nat->envVer);
-//     if (dbus_message_get_type(msg) != DBUS_MESSAGE_TYPE_SIGNAL) {
-//         LOGV("%s: not interested (not a signal).", __FUNCTION__);
-//         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
-//     }
+	if (dbus_message_get_type(msg) != DBUS_MESSAGE_TYPE_SIGNAL) {
+		printf("%s: not interested (not a signal).\n", __FUNCTION__);
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+	}
 
-//     LOGE("%s: Received signal %s:%s from %s", __FUNCTION__,
-//         dbus_message_get_interface(msg), dbus_message_get_member(msg),
-//         dbus_message_get_path(msg));
+	printf("%s: Received signal %s:%s from %s\n", __FUNCTION__,
+				 dbus_message_get_interface(msg), dbus_message_get_member(msg),
+				 dbus_message_get_path(msg));
 
 //     env->PushLocalFrame(EVENT_LOOP_REFS);
 //     if (dbus_message_is_signal(msg,
@@ -619,9 +656,194 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 
 // success:
 //     env->PopLocalFrame(NULL);
-    return DBUS_HANDLER_RESULT_HANDLED;
+	return DBUS_HANDLER_RESULT_HANDLED;
 }
 
+static unsigned int unix_events_to_dbus_flags(short events) {
+	return (events & DBUS_WATCH_READABLE ? POLLIN : 0) |
+		(events & DBUS_WATCH_WRITABLE ? POLLOUT : 0) |
+		(events & DBUS_WATCH_ERROR ? POLLERR : 0) |
+		(events & DBUS_WATCH_HANGUP ? POLLHUP : 0);
+}
+
+static short dbus_flags_to_unix_events(unsigned int flags) {
+	return (flags & POLLIN ? DBUS_WATCH_READABLE : 0) |
+		(flags & POLLOUT ? DBUS_WATCH_WRITABLE : 0) |
+		(flags & POLLERR ? DBUS_WATCH_ERROR : 0) |
+		(flags & POLLHUP ? DBUS_WATCH_HANGUP : 0);
+}
+
+#define EVENT_LOOP_EXIT 1
+#define EVENT_LOOP_ADD  2
+#define EVENT_LOOP_REMOVE 3
+
+void* DBusThread::eventLoop(void *ptr) {
+
+	char name[] = "BT EventLoop";
+	DBusThread* dbt = (DBusThread*)ptr;
+	bool result;
+	// dbus_connection_set_watch_functions(conn, dbusAddWatch,
+	// 																		dbusRemoveWatch, dbusToggleWatch, ptr, NULL);
+
+	dbt->running = true;
+	
+	while (1) {
+		for (int i = 0; i < dbt->pollMemberCount; i++) {
+			if (!dbt->pollData[i].revents) {
+				continue;
+			}
+			if (dbt->pollData[i].fd == dbt->controlFdR) {
+				char data;
+				while (recv(dbt->controlFdR, &data, sizeof(char), MSG_DONTWAIT)
+							 != -1) {
+					switch (data) {
+					case EVENT_LOOP_EXIT:
+					{
+						dbus_connection_set_watch_functions(dbt->mConnection,
+																								NULL, NULL, NULL, NULL, NULL);
+						// tearDownEventLoop(nat);
+						int fd = dbt->controlFdR;
+						dbt->controlFdR = 0;
+						close(fd);
+						return NULL;
+					}
+					case EVENT_LOOP_ADD:
+					{
+						// handleWatchAdd(nat);
+						break;
+					}
+					case EVENT_LOOP_REMOVE:
+					{
+						// handleWatchRemove(nat);
+						break;
+					}
+					}
+				}
+			} else {
+				short events = dbt->pollData[i].revents;
+				unsigned int flags = unix_events_to_dbus_flags(events);
+				dbus_watch_handle(dbt->watchData[i], flags);
+				dbt->pollData[i].revents = 0;
+				// can only do one - it may have caused a 'remove'
+				break;
+			}
+		}
+		while (dbus_connection_dispatch(dbt->mConnection) ==
+					 DBUS_DISPATCH_DATA_REMAINS) {
+		}
+
+		poll(dbt->pollData, dbt->pollMemberCount, -1);
+	}
+}
+
+bool DBusThread::startEventLoop() {
+	printf("Event loop?!\n");	
+	pthread_mutex_lock(&(thread_mutex));
+	printf("Event looping!\n");	
+	bool result = false;
+	running = false;
+	printf("moo?!\n");
+	if (pollData) {
+		printf("trying to start EventLoop a second time!\n");
+		pthread_mutex_unlock( &(thread_mutex) );
+		return false;
+	}
+	printf("polled?!");
+	pollData = (struct pollfd *)malloc(sizeof(struct pollfd) *
+																		 DEFAULT_INITIAL_POLLFD_COUNT);
+	if (!pollData) {
+		printf("out of memory error starting EventLoop!\n");
+		goto done;
+	}
+
+	watchData = (DBusWatch **)malloc(sizeof(DBusWatch *) *
+																	 DEFAULT_INITIAL_POLLFD_COUNT);
+	if (!watchData) {
+		printf("out of memory error starting EventLoop!\n");
+		goto done;
+	}
+
+	memset(pollData, 0, sizeof(struct pollfd) *
+				 DEFAULT_INITIAL_POLLFD_COUNT);
+	memset(watchData, 0, sizeof(DBusWatch *) *
+				 DEFAULT_INITIAL_POLLFD_COUNT);
+	pollDataSize = DEFAULT_INITIAL_POLLFD_COUNT;
+	pollMemberCount = 1;
+	printf("pairing?!\n");
+	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, &(controlFdR))) {
+		printf("Error getting BT control socket\n");
+		goto done;
+	}
+	pollData[0].fd = controlFdR;
+	pollData[0].events = POLLIN;
+	printf("Setting up loop\n");
+	if (setUpEventLoop() != true) {
+		printf("failure setting up Event Loop!\n");
+		goto done;
+	}
+	printf("Event loop starting!\n");
+	pthread_create(&(thread), NULL, DBusThread::eventLoop, this);
+	result = true;
+	printf("Event loop started!\n");
+done:
+	if (false == result) {
+		if (controlFdW) {
+			close(controlFdW);
+			controlFdW = 0;
+		}
+		if (controlFdR) {
+			close(controlFdR);
+			controlFdR = 0;
+		}
+		if (pollData) free(pollData);
+		pollData = NULL;
+		if (watchData) free(watchData);
+		watchData = NULL;
+		pollDataSize = 0;
+		pollMemberCount = 0;
+	}
+
+	pthread_mutex_unlock(&(thread_mutex));
+
+	return result;
+}
+
+void DBusThread::stopEventLoop() {
+
+	pthread_mutex_lock(&(thread_mutex));
+	if (pollData) {
+		char data = EVENT_LOOP_EXIT;
+		ssize_t t = write(controlFdW, &data, sizeof(char));
+		void *ret;
+		pthread_join(thread, &ret);
+
+		free(pollData);
+		pollData = NULL;
+		free(watchData);
+		watchData = NULL;
+		pollDataSize = 0;
+		pollMemberCount = 0;
+
+		int fd = controlFdW;
+		controlFdW = 0;
+		close(fd);
+	}
+	running = false;
+	pthread_mutex_unlock(&(thread_mutex));
+	printf("Event loop stopped!\n");	
+}
+
+bool DBusThread::isEventLoopRunning() {
+
+	bool result = false;
+	pthread_mutex_lock(&(thread_mutex));
+	if (running) {
+		result = true;
+	}
+	pthread_mutex_unlock(&(thread_mutex));
+
+	return result;
+}
 
 int main(int argc, char** argv) {
 	DBusThread t;
@@ -633,9 +855,12 @@ int main(int argc, char** argv) {
 	}
   b.get_adapter_path();
   b.get_adapter_properties();
+	t.startEventLoop();
+	sleep(100);
+	t.stopEventLoop();
 	// b.start_dbus_thread();
 	// b.start_device_discovery();
-	// sleep(10000);
+
 	// b.stop_device_discovery();
 	return 0;
 }

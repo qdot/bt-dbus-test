@@ -319,7 +319,8 @@ public:
 
   void get_adapter_path ();
   void get_adapter_properties();
-
+	void start_discovery();
+	
 	virtual void EventFilter(DBusMessage* msg);
   const char* mAdapterPath;
   bool mPowered;
@@ -429,6 +430,44 @@ void BluetoothAdapter::get_adapter_properties() {
   printf("Adapter properties got\n");
 }
 
+void BluetoothAdapter::start_discovery() {
+  DBusMessage *msg, *reply;
+  DBusError err;
+  dbus_error_init(&err);
+
+  reply = dbus_func_args(mAdapterPath,
+                         DBUS_ADAPTER_IFACE, "StartDiscovery",
+                         DBUS_TYPE_INVALID);
+  if (!reply) {
+    if (dbus_error_is_set(&err)) {
+      //LOG_AND_FREE_DBUS_ERROR(&err);
+      printf("Error!\n");
+    } else
+      printf("DBus reply is NULL in function %s\n", __FUNCTION__);
+    return ;
+  }
+  
+}
+
+#define EVENT_LOOP_EXIT 1
+#define EVENT_LOOP_ADD  2
+#define EVENT_LOOP_REMOVE 3
+
+
+static unsigned int unix_events_to_dbus_flags(short events) {
+	return (events & DBUS_WATCH_READABLE ? POLLIN : 0) |
+		(events & DBUS_WATCH_WRITABLE ? POLLOUT : 0) |
+		(events & DBUS_WATCH_ERROR ? POLLERR : 0) |
+		(events & DBUS_WATCH_HANGUP ? POLLHUP : 0);
+}
+
+static short dbus_flags_to_unix_events(unsigned int flags) {
+	return (flags & POLLIN ? DBUS_WATCH_READABLE : 0) |
+		(flags & POLLOUT ? DBUS_WATCH_WRITABLE : 0) |
+		(flags & POLLERR ? DBUS_WATCH_ERROR : 0) |
+		(flags & POLLHUP ? DBUS_WATCH_HANGUP : 0);
+}
+
 class DBusThread : protected RawDBusConnection {
 public:
 	DBusThread();
@@ -437,9 +476,13 @@ public:
 	bool startEventLoop();
 	void stopEventLoop();
 	bool isEventLoopRunning();
+	static dbus_bool_t addWatch(DBusWatch* w, void* ptr);
+	static void removeWatch(DBusWatch* w, void* ptr);
+	static void toggleWatch(DBusWatch* w, void* ptr);
 	static void* eventLoop(void* ptr);
 	static DBusHandlerResult event_filter(DBusConnection *conn, DBusMessage *msg,
 																				void *data);
+	static void handleWatchAdd(DBusThread* dbt);
 	void EventFilter(DBusMessage* msg);
 	
 	/* protects the thread */
@@ -472,6 +515,100 @@ DBusThread::DBusThread()
 DBusThread::~DBusThread()
 {
 }
+
+dbus_bool_t DBusThread::addWatch(DBusWatch *watch, void *data) {
+	printf("add Watch!\n");
+	DBusThread *dbt = (DBusThread *)data;
+
+	if (dbus_watch_get_enabled(watch)) {
+			printf("enabled Watch!\n");
+		// note that we can't just send the watch and inspect it later
+		// because we may get a removeWatch call before this data is reacted
+		// to by our eventloop and remove this watch..  reading the add first
+		// and then inspecting the recently deceased watch would be bad.
+		char control = EVENT_LOOP_ADD;
+		write(dbt->controlFdW, &control, sizeof(char));
+
+		int fd = dbus_watch_get_fd(watch);
+		write(dbt->controlFdW, &fd, sizeof(int));
+
+		unsigned int flags = dbus_watch_get_flags(watch);
+		write(dbt->controlFdW, &flags, sizeof(unsigned int));
+
+		write(dbt->controlFdW, &watch, sizeof(DBusWatch*));
+	}
+	return true;
+}
+
+void DBusThread::removeWatch(DBusWatch *watch, void *data) {
+	printf("remove Watch!\n");
+	DBusThread *dbt = (DBusThread *)data;
+
+	char control = EVENT_LOOP_REMOVE;
+	write(dbt->controlFdW, &control, sizeof(char));
+
+	int fd = dbus_watch_get_fd(watch);
+	write(dbt->controlFdW, &fd, sizeof(int));
+
+	unsigned int flags = dbus_watch_get_flags(watch);
+	write(dbt->controlFdW, &flags, sizeof(unsigned int));
+}
+
+void DBusThread::toggleWatch(DBusWatch *watch, void *data) {
+	printf("toggle Watch!\n");
+	if (dbus_watch_get_enabled(watch)) {
+		DBusThread::addWatch(watch, data);
+	} else {
+		DBusThread::removeWatch(watch, data);
+	}
+}
+
+void DBusThread::handleWatchAdd(DBusThread* dbt) {
+	DBusWatch *watch;
+	int newFD;
+	unsigned int flags;
+	printf("Handling watch addition!\n");
+	read(dbt->controlFdR, &newFD, sizeof(int));
+	read(dbt->controlFdR, &flags, sizeof(unsigned int));
+	read(dbt->controlFdR, &watch, sizeof(DBusWatch *));
+	short events = dbus_flags_to_unix_events(flags);
+
+	for (int y = 0; y<dbt->pollMemberCount; y++) {
+		if ((dbt->pollData[y].fd == newFD) &&
+				(dbt->pollData[y].events == events)) {
+			printf("DBusWatch duplicate add\n");
+			return;
+		}
+	}
+	if (dbt->pollMemberCount == dbt->pollDataSize) {
+		printf("Bluetooth EventLoop poll struct growing\n");
+		struct pollfd *temp = (struct pollfd *)malloc(
+			sizeof(struct pollfd) * (dbt->pollMemberCount+1));
+		if (!temp) {
+			return;
+		}
+		memcpy(temp, dbt->pollData, sizeof(struct pollfd) *
+					 dbt->pollMemberCount);
+		free(dbt->pollData);
+		dbt->pollData = temp;
+		DBusWatch **temp2 = (DBusWatch **)malloc(sizeof(DBusWatch *) *
+																						 (dbt->pollMemberCount+1));
+		if (!temp2) {
+			return;
+		}
+		memcpy(temp2, dbt->watchData, sizeof(DBusWatch *) *
+					 dbt->pollMemberCount);
+		free(dbt->watchData);
+		dbt->watchData = temp2;
+		dbt->pollDataSize++;
+	}
+	dbt->pollData[dbt->pollMemberCount].fd = newFD;
+	dbt->pollData[dbt->pollMemberCount].revents = 0;
+	dbt->pollData[dbt->pollMemberCount].events = events;
+	dbt->watchData[dbt->pollMemberCount] = watch;
+	dbt->pollMemberCount++;
+}
+
 
 bool
 DBusThread::setUpEventLoop()
@@ -519,7 +656,7 @@ DBusThread::setUpEventLoop()
 	// const char *agent_path = "/android/bluetooth/agent";
 	// const char *capabilities = "DisplayYesNo";
 	// if (register_agent(nat, agent_path, capabilities) < 0) {
-	// 	dbus_connection_unregister_object_path (nat->conn, agent_path);
+	// 	dbus_connection_unregister_object_path (dbt->conn, agent_path);
 	// 	return JNI_FALSE;
 	// }
 	return true;
@@ -536,7 +673,7 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 	dbus_error_init(&err);
 
 //     nat = (native_data_t *)data;
-//     nat->vm->GetEnv((void**)&env, nat->envVer);
+//     dbt->vm->GetEnv((void**)&env, dbt->envVer);
 	if (dbus_message_get_type(msg) != DBUS_MESSAGE_TYPE_SIGNAL) {
 		printf("%s: not interested (not a signal).\n", __FUNCTION__);
 		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -560,7 +697,7 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 //                     parse_remote_device_properties(env, &iter);
 //         }
 //         if (str_array != NULL) {
-//             env->CallVoidMethod(nat->me,
+//             env->CallVoidMethod(dbt->me,
 //                                 method_onDeviceFound,
 //                                 env->NewStringUTF(c_address),
 //                                 str_array);
@@ -575,7 +712,7 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 //                                   DBUS_TYPE_STRING, &c_address,
 //                                   DBUS_TYPE_INVALID)) {
 //             LOGV("... address = %s", c_address);
-//             env->CallVoidMethod(nat->me, method_onDeviceDisappeared,
+//             env->CallVoidMethod(dbt->me, method_onDeviceDisappeared,
 //                                 env->NewStringUTF(c_address));
 //         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
 //         goto success;
@@ -587,7 +724,7 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 //                                   DBUS_TYPE_OBJECT_PATH, &c_object_path,
 //                                   DBUS_TYPE_INVALID)) {
 //             LOGV("... address = %s", c_object_path);
-//             env->CallVoidMethod(nat->me,
+//             env->CallVoidMethod(dbt->me,
 //                                 method_onDeviceCreated,
 //                                 env->NewStringUTF(c_object_path));
 //         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
@@ -600,7 +737,7 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 //                                  DBUS_TYPE_OBJECT_PATH, &c_object_path,
 //                                  DBUS_TYPE_INVALID)) {
 //            LOGV("... Object Path = %s", c_object_path);
-//            env->CallVoidMethod(nat->me,
+//            env->CallVoidMethod(dbt->me,
 //                                method_onDeviceRemoved,
 //                                env->NewStringUTF(c_object_path));
 //         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
@@ -618,12 +755,12 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 //                     (jstring) env->GetObjectArrayElement(str_array, 1);
 //                 const char *c_value = env->GetStringUTFChars(value, NULL);
 //                 if (!strncmp(c_value, "true", strlen("true")))
-//                     nat->adapter = get_adapter_path(nat->conn);
+//                     dbt->adapter = get_adapter_path(dbt->conn);
 //                 env->ReleaseStringUTFChars(value, c_value);
 //             }
 //             env->ReleaseStringUTFChars(property, c_property);
 
-//             env->CallVoidMethod(nat->me,
+//             env->CallVoidMethod(dbt->me,
 //                               method_onPropertyChanged,
 //                               str_array);
 //         } else LOG_AND_FREE_DBUS_ERROR_WITH_MSG(&err, msg);
@@ -634,7 +771,7 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 //         jobjectArray str_array = parse_remote_device_property_change(env, msg);
 //         if (str_array != NULL) {
 //             const char *remote_device_path = dbus_message_get_path(msg);
-//             env->CallVoidMethod(nat->me,
+//             env->CallVoidMethod(dbt->me,
 //                             method_onDevicePropertyChanged,
 //                             env->NewStringUTF(remote_device_path),
 //                             str_array);
@@ -644,7 +781,7 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 //                                       "org.bluez.Device",
 //                                       "DisconnectRequested")) {
 //         const char *remote_device_path = dbus_message_get_path(msg);
-//         env->CallVoidMethod(nat->me,
+//         env->CallVoidMethod(dbt->me,
 //                             method_onDeviceDisconnectRequested,
 //                             env->NewStringUTF(remote_device_path));
 //         goto success;
@@ -659,31 +796,13 @@ DBusHandlerResult DBusThread::event_filter(DBusConnection *conn, DBusMessage *ms
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
 
-static unsigned int unix_events_to_dbus_flags(short events) {
-	return (events & DBUS_WATCH_READABLE ? POLLIN : 0) |
-		(events & DBUS_WATCH_WRITABLE ? POLLOUT : 0) |
-		(events & DBUS_WATCH_ERROR ? POLLERR : 0) |
-		(events & DBUS_WATCH_HANGUP ? POLLHUP : 0);
-}
-
-static short dbus_flags_to_unix_events(unsigned int flags) {
-	return (flags & POLLIN ? DBUS_WATCH_READABLE : 0) |
-		(flags & POLLOUT ? DBUS_WATCH_WRITABLE : 0) |
-		(flags & POLLERR ? DBUS_WATCH_ERROR : 0) |
-		(flags & POLLHUP ? DBUS_WATCH_HANGUP : 0);
-}
-
-#define EVENT_LOOP_EXIT 1
-#define EVENT_LOOP_ADD  2
-#define EVENT_LOOP_REMOVE 3
-
 void* DBusThread::eventLoop(void *ptr) {
 
 	char name[] = "BT EventLoop";
 	DBusThread* dbt = (DBusThread*)ptr;
 	bool result;
-	// dbus_connection_set_watch_functions(conn, dbusAddWatch,
-	// 																		dbusRemoveWatch, dbusToggleWatch, ptr, NULL);
+	dbus_connection_set_watch_functions(dbt->mConnection, DBusThread::addWatch,
+																			DBusThread::removeWatch, DBusThread::toggleWatch, ptr, NULL);
 
 	dbt->running = true;
 	
@@ -692,7 +811,9 @@ void* DBusThread::eventLoop(void *ptr) {
 			if (!dbt->pollData[i].revents) {
 				continue;
 			}
+
 			if (dbt->pollData[i].fd == dbt->controlFdR) {
+				printf("Got a watch request!\n");
 				char data;
 				while (recv(dbt->controlFdR, &data, sizeof(char), MSG_DONTWAIT)
 							 != -1) {
@@ -709,7 +830,7 @@ void* DBusThread::eventLoop(void *ptr) {
 					}
 					case EVENT_LOOP_ADD:
 					{
-						// handleWatchAdd(nat);
+						DBusThread::handleWatchAdd(dbt);
 						break;
 					}
 					case EVENT_LOOP_REMOVE:
@@ -720,6 +841,7 @@ void* DBusThread::eventLoop(void *ptr) {
 					}
 				}
 			} else {
+				printf("Got an watch handle!\n");
 				short events = dbt->pollData[i].revents;
 				unsigned int flags = unix_events_to_dbus_flags(events);
 				dbus_watch_handle(dbt->watchData[i], flags);
@@ -730,6 +852,8 @@ void* DBusThread::eventLoop(void *ptr) {
 		}
 		while (dbus_connection_dispatch(dbt->mConnection) ==
 					 DBUS_DISPATCH_DATA_REMAINS) {
+			printf("Got an event!\n");
+
 		}
 
 		poll(dbt->pollData, dbt->pollMemberCount, -1);
@@ -737,18 +861,15 @@ void* DBusThread::eventLoop(void *ptr) {
 }
 
 bool DBusThread::startEventLoop() {
-	printf("Event loop?!\n");	
 	pthread_mutex_lock(&(thread_mutex));
-	printf("Event looping!\n");	
 	bool result = false;
 	running = false;
-	printf("moo?!\n");
+	printf("Hey, what's controlFdR right now? %d\n", controlFdR);
 	if (pollData) {
 		printf("trying to start EventLoop a second time!\n");
 		pthread_mutex_unlock( &(thread_mutex) );
 		return false;
 	}
-	printf("polled?!");
 	pollData = (struct pollfd *)malloc(sizeof(struct pollfd) *
 																		 DEFAULT_INITIAL_POLLFD_COUNT);
 	if (!pollData) {
@@ -769,22 +890,19 @@ bool DBusThread::startEventLoop() {
 				 DEFAULT_INITIAL_POLLFD_COUNT);
 	pollDataSize = DEFAULT_INITIAL_POLLFD_COUNT;
 	pollMemberCount = 1;
-	printf("pairing?!\n");
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, &(controlFdR))) {
 		printf("Error getting BT control socket\n");
 		goto done;
 	}
 	pollData[0].fd = controlFdR;
 	pollData[0].events = POLLIN;
-	printf("Setting up loop\n");
 	if (setUpEventLoop() != true) {
 		printf("failure setting up Event Loop!\n");
 		goto done;
 	}
-	printf("Event loop starting!\n");
+	printf("Control file descriptor: %d\n", controlFdR);
 	pthread_create(&(thread), NULL, DBusThread::eventLoop, this);
 	result = true;
-	printf("Event loop started!\n");
 done:
 	if (false == result) {
 		if (controlFdW) {
@@ -849,13 +967,13 @@ int main(int argc, char** argv) {
 	DBusThread t;
   BluetoothAdapter b;
   b.createDBusConnection();
-	if(!t.setUpEventLoop()) {
-		printf("Cannot set up event loop!\n");
-		return 1;
-	}
   b.get_adapter_path();
   b.get_adapter_properties();
-	t.startEventLoop();
+	if(!t.startEventLoop()) {
+		printf("Cannot start loop!\n");
+		return 1;
+	}
+	b.start_discovery();
 	sleep(100);
 	t.stopEventLoop();
 	// b.start_dbus_thread();
